@@ -28,8 +28,13 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.compose',  # Create/send emails
     'https://www.googleapis.com/auth/gmail.readonly'  # Read-only access
 ]
-TOKEN_PATH = Path('token.json')
-CREDENTIALS_PATH = Path('config/client_secret.json')
+# Get the directory where the server.py script is located
+SCRIPT_DIR = Path(__file__).resolve().parent
+# Construct absolute paths relative to the script's directory
+# Assumes config/ and token.json are relative to the project root (one level up from src/)
+PROJECT_ROOT = SCRIPT_DIR.parent
+TOKEN_PATH = PROJECT_ROOT / 'token.json'
+CREDENTIALS_PATH = PROJECT_ROOT / 'config/client_secret.json'
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +129,40 @@ class GmailMCPServer:
         
         return "\n".join(formatted_msgs)
     
+    def _extract_message_body(self, payload: Dict[str, Any]) -> str:
+        """Extract the message body from the payload, preferring text/plain."""
+        body = ""
+        if payload.get('mimeType') == 'text/plain' and 'data' in payload.get('body', {}):
+            encoded_body = payload['body']['data']
+            decoded_body = base64.urlsafe_b64decode(encoded_body).decode('utf-8')
+            return decoded_body
+        elif payload.get('mimeType') == 'text/html' and 'data' in payload.get('body', {}):
+            encoded_body = payload['body']['data']
+            decoded_body = base64.urlsafe_b64decode(encoded_body).decode('utf-8')
+            # Keep HTML as a fallback if plain text wasn't found yet
+            body = decoded_body # We might return this if no plain text is found later
+        elif payload.get('mimeType', '').startswith('multipart/'):
+            parts = payload.get('parts', [])
+            plain_text_body = ""
+            html_body = ""
+            for part in parts:
+                # Recursively check parts, prioritize the result from text/plain
+                part_body = self._extract_message_body(part)
+                if part.get('mimeType') == 'text/plain' and part_body:
+                    plain_text_body = part_body
+                    break # Found plain text, stop searching this level
+                elif part.get('mimeType') == 'text/html' and part_body and not html_body:
+                     # Keep first HTML body found as fallback
+                    html_body = part_body
+
+            # Return plain text if found, otherwise HTML, otherwise whatever was in 'body' initially
+            return plain_text_body if plain_text_body else html_body if html_body else body
+
+        # If no body found in parts or specific types, return the initial fallback (might be empty)
+        return body
+
     def _setup_resources(self):
-        """Set up MCP resources."""
+        """Set up MCP resources (data sources accessible via URI)."""
 
         @self.mcp.resource("test://hello")
         async def get_hello() -> str:
@@ -134,7 +171,7 @@ class GmailMCPServer:
 
         @self.mcp.resource("gmail://inbox")
         async def get_emails() -> str:
-            """Get emails from inbox."""
+            """Get a list of recent emails (metadata only) from the inbox."""
             max_results = 10
             logger.info(f"Executing get_emails with fixed max_results={max_results}")
             try:
@@ -170,7 +207,7 @@ class GmailMCPServer:
 
         @self.mcp.resource("gmail://drafts/{max_results}")
         async def get_drafts(max_results: int = 10) -> str:
-            """Get email drafts."""
+            """Get a list of recent email drafts (metadata only)."""
             logger.info(f"Executing get_drafts with max_results={max_results}")
             try:
                 logger.info("Attempting to get Gmail service (get_drafts)...")
@@ -225,7 +262,7 @@ class GmailMCPServer:
 
         @self.mcp.resource("gmail://sent/{max_results}")
         async def get_sent_emails(max_results: int = 10) -> str:
-            """Get sent emails."""
+            """Get a list of recent sent emails (metadata only)."""
             logger.info(f"Executing get_sent_emails with max_results={max_results}")
             try:
                 logger.info("Attempting to get Gmail service (get_sent_emails)...")
@@ -258,12 +295,67 @@ class GmailMCPServer:
             except Exception as e:
                 logger.error(f"Error inside get_sent_emails: {e}", exc_info=True)
                 return f"Error retrieving sent messages: {str(e)}"
-    
+
     def _setup_tools(self):
-        """Set up MCP tools."""
+        """Set up MCP tools (executable actions callable by name)."""
+
+        @self.mcp.tool("get_email_content")
+        async def get_email_content(message_id: str) -> str:
+            """Fetches the full body content of a specific email using its unique message ID.
+            Use this tool when you need the actual text content of an email after finding its ID.
+
+            Args:
+                message_id: The unique identifier of the Gmail message.
+            """
+            logger.info(f"Executing get_email_content for message_id={message_id}")
+            try:
+                logger.info("Attempting to get Gmail service (get_email_content)...")
+                service = await anyio.to_thread.run_sync(self._get_gmail_service)
+                if not service:
+                    logger.warning("Failed to get Gmail service in get_email_content")
+                    return "Failed to authenticate Gmail service"
+                logger.info("Gmail service obtained successfully (get_email_content).")
+
+                logger.info(f"Attempting to get full message content for ID: {message_id}...")
+                def _get_full_message():
+                    return service.users().messages().get(
+                        userId='me',
+                        id=message_id,
+                        format='full' # Request full format to get the body
+                    ).execute()
+
+                message_data = await anyio.to_thread.run_sync(_get_full_message)
+                logger.info(f"Full message data received for ID: {message_id}")
+
+                if not message_data or 'payload' not in message_data:
+                     logger.warning(f"No payload found for message ID: {message_id}")
+                     return f"Could not retrieve content for message ID: {message_id}"
+
+                # Extract the body using the helper function
+                body_content = await anyio.to_thread.run_sync(self._extract_message_body, message_data['payload'])
+
+                if not body_content:
+                    logger.info(f"No suitable body content found for message ID: {message_id}. Returning snippet.")
+                    # Fallback to snippet if body extraction fails
+                    return message_data.get('snippet', 'No content available.')
+                else:
+                    logger.info(f"Body content extracted successfully for message ID: {message_id}")
+                    return body_content
+
+            except Exception as e:
+                logger.error(f"Error inside get_email_content: {e}", exc_info=True)
+                return f"Error retrieving message content for ID {message_id}: {str(e)}"
+
         @self.mcp.tool("search_emails")
         async def search_emails(query: str, max_results: int = 10) -> str:
-            """Search emails using Gmail query."""
+            """Search emails using a standard Gmail query string (e.g., 'subject:urgent', 'from:boss@example.com').
+            Returns a list of matching emails with their metadata (From, To, Subject, Date, ID).
+            Does not return the full email body content.
+
+            Args:
+                query: The Gmail search query string.
+                max_results: Maximum number of results to return.
+            """
             logger.info(f"Executing search_emails with query='{query}', max_results={max_results}")
             try:
                 logger.info("Attempting to get Gmail service (search_emails)...")
@@ -299,7 +391,14 @@ class GmailMCPServer:
 
         @self.mcp.tool("compose_email")
         async def compose_email(to: str, subject: str, body: str, save_as_draft: bool = False) -> str:
-            """Compose and send/save an email."""
+            """Composes an email and either saves it as a draft or sends it immediately.
+
+            Args:
+                to: Recipient email address.
+                subject: Subject line of the email.
+                body: The plain text content of the email body.
+                save_as_draft: If True, saves the email as a draft instead of sending. Defaults to False (send immediately).
+            """
             logger.info(f"Executing compose_email (To: {to}, Subject: {subject}, SaveAsDraft: {save_as_draft})")
             try:
                 logger.info("Attempting to get Gmail service (compose_email)...")
